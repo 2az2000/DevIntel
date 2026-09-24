@@ -1,0 +1,1001 @@
+// DevIntel — data model
+// Reference: docs/01-data-model.md · ADR-0001, ADR-0002, ADR-0005
+//
+// Layer rules:
+//   tenancy/identity  mutable
+//   integration       mutable
+//   staging           append + status flip
+//   domain            upsert only
+//   analytics         recomputable — rebuildable from the domain layer
+//
+// Every model below the tenancy layer carries workspaceId. TENANT_SCOPED_MODELS
+// is derived from the DMMF, so a model with this field is protected by the
+// tenant client automatically, and one without it is silently unprotected.
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/db/generated"
+  moduleFormat = "esm"
+}
+
+// Prisma 7: the connection URL lives in prisma.config.ts for CLI commands, and
+// reaches the client through a driver adapter (src/db/client.ts).
+datasource db {
+  provider = "postgresql"
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Tenancy & identity
+// ════════════════════════════════════════════════════════════════════════════
+
+model User {
+  id              String    @id @default(cuid())
+  /// Stored lowercased; the application normalizes on write.
+  email           String    @unique
+  passwordHash    String?   @map("password_hash")
+  name            String?
+  avatarUrl       String?   @map("avatar_url")
+  emailVerifiedAt DateTime? @map("email_verified_at")
+  lastLoginAt     DateTime? @map("last_login_at")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  sessions       Session[]
+  oauthAccounts  UserOAuthAccount[]
+  memberships    WorkspaceMember[]
+  ownedWorkspace Workspace[]        @relation("WorkspaceOwner")
+  claimedAs      Developer[]        @relation("DeveloperClaim")
+  auditLogs      AuditLog[]
+  notifications  Notification[]
+  reports        Report[]
+
+  @@map("users")
+}
+
+/// Account linking: the same person signing in with GitHub and with email
+/// lands on one User.
+model UserOAuthAccount {
+  id             String   @id @default(cuid())
+  userId         String   @map("user_id")
+  provider       Provider
+  providerUserId String   @map("provider_user_id")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerUserId])
+  @@index([userId])
+  @@map("user_oauth_accounts")
+}
+
+model Session {
+  id            String   @id @default(cuid())
+  userId        String   @map("user_id")
+  /// SHA-256 of the token. The raw token is never stored, so a database leak
+  /// does not yield usable sessions.
+  tokenHash     String   @unique @map("token_hash")
+  kind          String   @default("refresh")
+  expiresAt     DateTime @map("expires_at")
+  /// Rotation chain. Presenting a rotated token revokes the whole chain.
+  rotatedFromId String?  @map("rotated_from_id")
+  revokedAt     DateTime? @map("revoked_at")
+  ip            String?
+  userAgent     String?  @map("user_agent")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+model Workspace {
+  id            String   @id @default(cuid())
+  name          String
+  slug          String   @unique
+  ownerUserId   String   @map("owner_user_id")
+  /// null = unlimited
+  retentionDays Int?     @map("retention_days")
+  /// IANA name. Drives day bucketing — changing it enqueues a full recompute.
+  timezone      String   @default("UTC")
+  weekStartsOn  Int      @default(1) @map("week_starts_on")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+  deletedAt     DateTime? @map("deleted_at")
+
+  owner User @relation("WorkspaceOwner", fields: [ownerUserId], references: [id])
+
+  members       WorkspaceMember[]
+  teams         Team[]
+  teamMembers   TeamMember[]
+  developers    Developer[]
+  identities    DeveloperIdentity[]
+  integrations  Integration[]
+  syncCursors   SyncCursor[]
+  syncRuns      SyncRun[]
+  rawEvents     RawEvent[]
+  repositories  Repository[]
+  commits       Commit[]
+  pullRequests  PullRequest[]
+  reviews       PullRequestReview[]
+  issues        Issue[]
+  contributors  RepositoryContributor[]
+  metrics       MetricSnapshot[]
+  scores        ScoreSnapshot[]
+  devRollups    DeveloperDailyRollup[]
+  repoRollups   RepositoryDailyRollup[]
+  teamRollups   TeamDailyRollup[]
+  insights      Insight[]
+  notifications Notification[]
+  reports       Report[]
+  auditLogs     AuditLog[]
+
+  @@index([ownerUserId])
+  @@map("workspaces")
+}
+
+model WorkspaceMember {
+  id          String   @id @default(cuid())
+  workspaceId String   @map("workspace_id")
+  userId      String   @map("user_id")
+  role        Role     @default(MEMBER)
+  joinedAt    DateTime @default(now()) @map("joined_at")
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, userId])
+  @@index([workspaceId])
+  @@index([userId])
+  @@map("workspace_members")
+}
+
+model Team {
+  id          String   @id @default(cuid())
+  workspaceId String   @map("workspace_id")
+  name        String
+  slug        String
+  description String?
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  workspace Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  members   TeamMember[]
+  rollups   TeamDailyRollup[]
+
+  @@unique([workspaceId, slug])
+  @@index([workspaceId])
+  @@map("teams")
+}
+
+/// References developerId, not userId: activity attaches to developers, and
+/// requiring a platform account would make team metrics incomplete on day one.
+model TeamMember {
+  id          String   @id @default(cuid())
+  /// Carried directly rather than reached through Team: a query on this table
+  /// alone must still be tenant-scoped. See ADR-0005.
+  workspaceId String   @map("workspace_id")
+  teamId      String   @map("team_id")
+  developerId String   @map("developer_id")
+  joinedAt    DateTime @default(now()) @map("joined_at")
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  team      Team      @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  developer Developer @relation(fields: [developerId], references: [id], onDelete: Cascade)
+
+  @@unique([teamId, developerId])
+  @@index([workspaceId])
+  @@index([developerId])
+  @@map("team_members")
+}
+
+/// A person as observed in git history, scoped to one workspace. NOT an account.
+model Developer {
+  id              String   @id @default(cuid())
+  workspaceId     String   @map("workspace_id")
+  displayName     String   @map("display_name")
+  primaryEmail    String?  @map("primary_email")
+  avatarUrl       String?  @map("avatar_url")
+  /// Set when a platform user proves they are this developer.
+  claimedByUserId String?  @map("claimed_by_user_id")
+  /// Excluded from every people-facing metric, still counted in repo activity.
+  isBot           Boolean  @default(false) @map("is_bot")
+  /// Set when two developers are merged. Queries follow the pointer; nothing
+  /// is deleted, so a wrong merge is reversible.
+  mergedIntoId    String?  @map("merged_into_id")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  workspace  Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  claimedBy  User?      @relation("DeveloperClaim", fields: [claimedByUserId], references: [id])
+  mergedInto Developer? @relation("DeveloperMerge", fields: [mergedIntoId], references: [id])
+  mergedFrom Developer[] @relation("DeveloperMerge")
+
+  identities       DeveloperIdentity[]
+  teamMemberships  TeamMember[]
+  authoredCommits  Commit[]                @relation("CommitAuthor")
+  committedCommits Commit[]                @relation("CommitCommitter")
+  authoredPrs      PullRequest[]           @relation("PrAuthor")
+  mergedPrs        PullRequest[]           @relation("PrMergedBy")
+  reviews          PullRequestReview[]
+  authoredIssues   Issue[]                 @relation("IssueAuthor")
+  assignedIssues   Issue[]                 @relation("IssueAssignee")
+  contributions    RepositoryContributor[]
+  rollups          DeveloperDailyRollup[]
+
+  @@index([workspaceId, isBot])
+  @@index([workspaceId, claimedByUserId])
+  @@index([mergedIntoId])
+  @@map("developers")
+}
+
+/// The resolution table. A commit knows an email; a PR knows a provider user id.
+/// Treating those as one key is how this kind of model breaks. See ADR-0002.
+model DeveloperIdentity {
+  id          String             @id @default(cuid())
+  workspaceId String             @map("workspace_id")
+  developerId String             @map("developer_id")
+  provider    Provider
+  kind        IdentityKind
+  /// Stored lowercased for EMAIL; the login or node id for PROVIDER_USER.
+  value       String
+  confidence  IdentityConfidence @default(EXACT)
+  createdAt   DateTime           @default(now()) @map("created_at")
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  developer Developer @relation(fields: [developerId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, provider, kind, value])
+  @@index([workspaceId, developerId])
+  @@map("developer_identities")
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Integration & sync state
+// ════════════════════════════════════════════════════════════════════════════
+
+model Integration {
+  id                String            @id @default(cuid())
+  workspaceId       String            @map("workspace_id")
+  provider          Provider
+  externalAccountId String            @map("external_account_id")
+  accountLogin      String            @map("account_login")
+  /// AES-256-GCM. Never leaves the server, never serialized by any endpoint.
+  accessTokenEnc    Bytes?            @map("access_token_enc")
+  refreshTokenEnc   Bytes?            @map("refresh_token_enc")
+  tokenExpiresAt    DateTime?         @map("token_expires_at")
+  scopes            String[]
+  /// Provider-specific state that has no column of its own: the GitHub
+  /// installation id in M7, and the seed dataset's anchor today.
+  ///
+  /// The anchor is PINNED on first sync and reused forever after. Without it
+  /// the generator would default to `new Date()`, every run would produce
+  /// slightly different data, every payload would hash differently, and
+  /// re-running the seed would append a second copy of history instead of
+  /// being a no-op.
+  providerMetadata  Json      @default("{}") @map("provider_metadata")
+  webhookSecretEnc  Bytes?            @map("webhook_secret_enc")
+  status            IntegrationStatus @default(ACTIVE)
+  lastSyncedAt      DateTime?         @map("last_synced_at")
+  createdAt         DateTime          @default(now()) @map("created_at")
+  updatedAt         DateTime          @updatedAt @map("updated_at")
+
+  workspace    Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  repositories Repository[]
+  cursors      SyncCursor[]
+  syncRuns     SyncRun[]
+
+  @@unique([workspaceId, provider, externalAccountId])
+  @@index([workspaceId, status])
+  @@map("integrations")
+}
+
+/// What makes incremental sync possible. Advanced only after a page is durably
+/// written, so a crash re-fetches at most one page.
+model SyncCursor {
+  id            String       @id @default(cuid())
+  /// Carried directly so cursor queries are tenant-scoped without a join.
+  workspaceId   String       @map("workspace_id")
+  integrationId String       @map("integration_id")
+  /// Provider-space identity, NOT a foreign key.
+  ///
+  /// A cursor records "where am I in the provider's data", which exists before
+  /// any domain row does — ingest checkpoints long before normalize creates the
+  /// Repository. Keying on the FK would make sync depend on its own output.
+  ///
+  /// `""` means the integration itself rather than one repository (the
+  /// REPOSITORIES listing). A sentinel rather than NULL because Postgres treats
+  /// NULLs as distinct in a unique index, so a nullable column here would allow
+  /// unlimited duplicate cursors — silently, and only under concurrency.
+  repositoryExternalId String  @default("") @map("repository_external_id")
+  /// Convenience link, filled in by normalize once the row exists. Never part
+  /// of the identity of a cursor.
+  repositoryId  String?      @map("repository_id")
+  resource      SyncResource
+  cursor        String?
+  /// High-water mark for time-filtered endpoints.
+  since         DateTime?
+  status        SyncStatus   @default(IDLE)
+  lastSyncedAt  DateTime?    @map("last_synced_at")
+  lastError     String?      @map("last_error")
+  updatedAt     DateTime     @updatedAt @map("updated_at")
+
+  workspace   Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  integration Integration @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+  repository  Repository? @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+
+  @@unique([integrationId, repositoryExternalId, resource])
+  @@index([workspaceId])
+  @@index([integrationId])
+  @@map("sync_cursors")
+}
+
+model SyncRun {
+  id            String     @id @default(cuid())
+  workspaceId   String     @map("workspace_id")
+  integrationId String     @map("integration_id")
+  kind          SyncKind
+  status        SyncStatus @default(RUNNING)
+  /// Per-resource counts. This is what the SSE progress stream reads.
+  stats         Json       @default("{}")
+  error         String?
+  startedAt     DateTime   @default(now()) @map("started_at")
+  finishedAt    DateTime?  @map("finished_at")
+
+  workspace   Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  integration Integration @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, startedAt])
+  @@index([integrationId, status])
+  @@map("sync_runs")
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Staging
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Everything a provider gives us lands here first, unchanged. When a metric
+/// looks wrong six weeks later, this is what answers "bad data or bad maths?".
+model RawEvent {
+  id            String         @id @default(cuid())
+  workspaceId   String         @map("workspace_id")
+  integrationId String         @map("integration_id")
+  provider      Provider
+  eventType     String         @map("event_type")
+  externalId    String         @map("external_id")
+  /// SHA-256 of the normalized payload. Makes a genuine update a new row while
+  /// a duplicate delivery collapses into the existing one.
+  contentHash   String         @map("content_hash")
+  deliveryId    String?        @map("delivery_id")
+  payload       Json
+  status        RawEventStatus @default(PENDING)
+  attempts      Int            @default(0)
+  error         String?
+  receivedAt    DateTime       @default(now()) @map("received_at")
+  processedAt   DateTime?      @map("processed_at")
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, eventType, externalId, contentHash])
+  @@index([status, receivedAt])
+  @@index([workspaceId, receivedAt])
+  @@map("raw_events")
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Domain — upsert only
+// ════════════════════════════════════════════════════════════════════════════
+
+model Repository {
+  id               String    @id @default(cuid())
+  workspaceId      String    @map("workspace_id")
+  integrationId    String    @map("integration_id")
+  provider         Provider
+  externalId       String    @map("external_id")
+  owner            String
+  name             String
+  fullName         String    @map("full_name")
+  defaultBranch    String    @default("main") @map("default_branch")
+  isPrivate        Boolean   @default(false) @map("is_private")
+  isArchived       Boolean   @default(false) @map("is_archived")
+  isFork           Boolean   @default(false) @map("is_fork")
+  primaryLanguage  String?   @map("primary_language")
+  /// { "TypeScript": 184320, "CSS": 9210 } — bytes per language
+  languages        Json      @default("{}")
+  stars            Int       @default(0)
+  forks            Int       @default(0)
+  openIssuesCount  Int       @default(0) @map("open_issues_count")
+  createdAtRemote  DateTime? @map("created_at_remote")
+  pushedAtRemote   DateTime? @map("pushed_at_remote")
+  /// The user chooses which repositories are tracked.
+  syncEnabled      Boolean   @default(true) @map("sync_enabled")
+  trackedAt        DateTime  @default(now()) @map("tracked_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+
+  workspace   Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  integration Integration @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+
+  commits      Commit[]
+  pullRequests PullRequest[]
+  reviews      PullRequestReview[]
+  issues       Issue[]
+  contributors RepositoryContributor[]
+  cursors      SyncCursor[]
+  rollups      RepositoryDailyRollup[]
+
+  @@unique([workspaceId, provider, externalId])
+  @@index([workspaceId, syncEnabled])
+  @@index([workspaceId, fullName])
+  @@map("repositories")
+}
+
+model Commit {
+  id                   String   @id @default(cuid())
+  workspaceId          String   @map("workspace_id")
+  repositoryId         String   @map("repository_id")
+  sha                  String
+  authorDeveloperId    String?  @map("author_developer_id")
+  committerDeveloperId String?  @map("committer_developer_id")
+  /// The metric timestamp. Rebases and cherry-picks rewrite committedAt and
+  /// would otherwise teleport a month of work into one afternoon.
+  authoredAt           DateTime @map("authored_at")
+  committedAt          DateTime @map("committed_at")
+  message              String
+  additions            Int      @default(0)
+  deletions            Int      @default(0)
+  changedFiles         Int      @default(0) @map("changed_files")
+  parentCount          Int      @default(1) @map("parent_count")
+  isMerge              Boolean  @default(false) @map("is_merge")
+
+  workspace  Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  repository Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+  author     Developer? @relation("CommitAuthor", fields: [authorDeveloperId], references: [id])
+  committer  Developer? @relation("CommitCommitter", fields: [committerDeveloperId], references: [id])
+
+  @@unique([repositoryId, sha])
+  @@index([workspaceId, authoredAt])
+  @@index([repositoryId, authoredAt])
+  @@index([workspaceId, authorDeveloperId, authoredAt])
+  @@map("commits")
+}
+
+/// Lifecycle timings are materialized here at normalize time — §37 forbids
+/// recomputing history on every dashboard load. Nulls are meaningful:
+/// timeToFirstReviewMinutes IS NULL means "not yet reviewed", not zero.
+model PullRequest {
+  id                       String           @id @default(cuid())
+  workspaceId              String           @map("workspace_id")
+  repositoryId             String           @map("repository_id")
+  externalId               String           @map("external_id")
+  number                   Int
+  title                    String
+  state                    PullRequestState
+  isDraft                  Boolean          @default(false) @map("is_draft")
+  authorDeveloperId        String?          @map("author_developer_id")
+  mergedByDeveloperId      String?          @map("merged_by_developer_id")
+  baseBranch               String           @map("base_branch")
+  headBranch               String           @map("head_branch")
+  additions                Int              @default(0)
+  deletions                Int              @default(0)
+  changedFiles             Int              @default(0) @map("changed_files")
+  commitCount              Int              @default(0) @map("commit_count")
+
+  createdAtRemote          DateTime         @map("created_at_remote")
+  updatedAtRemote          DateTime?        @map("updated_at_remote")
+  /// The clock starts here — draft time is excluded from review latency.
+  readyForReviewAt         DateTime?        @map("ready_for_review_at")
+  /// Earliest non-author review. Self-reviews never count.
+  firstReviewAt            DateTime?        @map("first_review_at")
+  firstApprovalAt          DateTime?        @map("first_approval_at")
+  mergedAt                 DateTime?        @map("merged_at")
+  closedAt                 DateTime?        @map("closed_at")
+
+  reviewRounds             Int              @default(0) @map("review_rounds")
+  reopenCount              Int              @default(0) @map("reopen_count")
+
+  timeToFirstReviewMinutes Int?             @map("time_to_first_review_minutes")
+  reviewDurationMinutes    Int?             @map("review_duration_minutes")
+  cycleTimeMinutes         Int?             @map("cycle_time_minutes")
+
+  workspace  Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  repository Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+  author     Developer? @relation("PrAuthor", fields: [authorDeveloperId], references: [id])
+  mergedBy   Developer? @relation("PrMergedBy", fields: [mergedByDeveloperId], references: [id])
+  reviews    PullRequestReview[]
+
+  @@unique([repositoryId, number])
+  @@index([workspaceId, state])
+  @@index([workspaceId, authorDeveloperId, createdAtRemote])
+  @@index([repositoryId, createdAtRemote])
+  // A partial index on open PRs is added by raw SQL in the migration —
+  // Prisma cannot express `WHERE state = 'OPEN'`. See docs/01 §5.3.
+  @@map("pull_requests")
+}
+
+model PullRequestReview {
+  id                  String      @id @default(cuid())
+  workspaceId         String      @map("workspace_id")
+  repositoryId        String      @map("repository_id")
+  pullRequestId       String      @map("pull_request_id")
+  externalId          String      @map("external_id")
+  reviewerDeveloperId String?     @map("reviewer_developer_id")
+  state               ReviewState
+  submittedAt         DateTime    @map("submitted_at")
+  commentCount        Int         @default(0) @map("comment_count")
+  /// From PR ready, or from the previous round.
+  responseTimeMinutes Int?        @map("response_time_minutes")
+
+  workspace   Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  repository  Repository  @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+  pullRequest PullRequest @relation(fields: [pullRequestId], references: [id], onDelete: Cascade)
+  reviewer    Developer?  @relation(fields: [reviewerDeveloperId], references: [id])
+
+  @@unique([repositoryId, externalId])
+  @@index([pullRequestId, submittedAt])
+  @@index([workspaceId, reviewerDeveloperId, submittedAt])
+  @@map("pull_request_reviews")
+}
+
+model Issue {
+  id                    String     @id @default(cuid())
+  workspaceId           String     @map("workspace_id")
+  repositoryId          String     @map("repository_id")
+  externalId            String     @map("external_id")
+  number                Int
+  title                 String
+  state                 IssueState
+  authorDeveloperId     String?    @map("author_developer_id")
+  assigneeDeveloperId   String?    @map("assignee_developer_id")
+  /// Provider-defined strings, only ever filtered on — a text array with a GIN
+  /// index rather than a join table.
+  labels                String[]
+  createdAtRemote       DateTime   @map("created_at_remote")
+  closedAt              DateTime?  @map("closed_at")
+  resolutionTimeMinutes Int?       @map("resolution_time_minutes")
+
+  workspace  Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  repository Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+  author     Developer? @relation("IssueAuthor", fields: [authorDeveloperId], references: [id])
+  assignee   Developer? @relation("IssueAssignee", fields: [assigneeDeveloperId], references: [id])
+
+  @@unique([repositoryId, number])
+  @@index([workspaceId, state])
+  @@index([repositoryId, createdAtRemote])
+  @@index([labels], type: Gin)
+  @@map("issues")
+}
+
+/// A maintained summary so bus-factor and ownership analysis is a small indexed
+/// read instead of a scan over the repository's whole commit history.
+model RepositoryContributor {
+  id                 String   @id @default(cuid())
+  workspaceId        String   @map("workspace_id")
+  repositoryId       String   @map("repository_id")
+  developerId        String   @map("developer_id")
+  commits            Int      @default(0)
+  additions          Int      @default(0)
+  deletions          Int      @default(0)
+  prsAuthored        Int      @default(0) @map("prs_authored")
+  prsMerged          Int      @default(0) @map("prs_merged")
+  reviewsGiven       Int      @default(0) @map("reviews_given")
+  contributionShare  Decimal  @default(0) @map("contribution_share") @db.Decimal(5, 4)
+  firstContributionAt DateTime? @map("first_contribution_at")
+  lastContributionAt  DateTime? @map("last_contribution_at")
+  updatedAt          DateTime @updatedAt @map("updated_at")
+
+  workspace  Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  repository Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+  developer  Developer  @relation(fields: [developerId], references: [id], onDelete: Cascade)
+
+  @@unique([repositoryId, developerId])
+  @@index([workspaceId, developerId])
+  @@map("repository_contributors")
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Analytics — recomputable
+// ════════════════════════════════════════════════════════════════════════════
+
+/// The narrow history table. Every trend and anomaly algorithm reads ONLY this,
+/// which is why adding a metric is a new metricKey and never a migration.
+model MetricSnapshot {
+  id          String      @id @default(cuid())
+  workspaceId String      @map("workspace_id")
+  subjectType SubjectType @map("subject_type")
+  /// Polymorphic; not an FK — validated by the writer.
+  subjectId   String      @map("subject_id")
+  metricKey   MetricKey   @map("metric_key")
+  granularity Granularity
+  periodStart DateTime    @map("period_start") @db.Date
+  value       Decimal     @db.Decimal(18, 4)
+  /// How many observations produced it — guards against noisy medians.
+  sampleSize  Int         @default(0) @map("sample_size")
+  computedAt  DateTime    @default(now()) @map("computed_at")
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, subjectType, subjectId, metricKey, granularity, periodStart])
+  @@index([workspaceId, metricKey, granularity, periodStart])
+  @@map("metric_snapshots")
+}
+
+/// Scores are kept apart from metrics because they carry a component breakdown
+/// and a weights version. The diff of two components arrays IS the explanation.
+model ScoreSnapshot {
+  id          String      @id @default(cuid())
+  workspaceId String      @map("workspace_id")
+  subjectType SubjectType @map("subject_type")
+  subjectId   String      @map("subject_id")
+  scoreKey    ScoreKey    @map("score_key")
+  granularity Granularity
+  periodStart DateTime    @map("period_start") @db.Date
+  value       Decimal     @db.Decimal(6, 2)
+  coverage    Decimal     @default(1) @db.Decimal(4, 3)
+  /// [{ key, raw, unit, normalized, weight, contribution, status }]
+  components  Json
+  /// Weights version, e.g. "dev-score@1.0.0". Persisted so changing weights
+  /// never silently rewrites history.
+  version     String
+  computedAt  DateTime    @default(now()) @map("computed_at")
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, subjectType, subjectId, scoreKey, granularity, periodStart])
+  @@index([workspaceId, scoreKey, periodStart])
+  @@map("score_snapshots")
+}
+
+/// Wide read tables. A 90-day dashboard is one indexed range scan of <=90 rows
+/// per subject — no joins, no aggregation, no window functions at request time.
+model DeveloperDailyRollup {
+  workspaceId                     String   @map("workspace_id")
+  developerId                     String   @map("developer_id")
+  day                             DateTime @db.Date
+  commits                         Int      @default(0)
+  additions                       Int      @default(0)
+  deletions                       Int      @default(0)
+  prsOpened                       Int      @default(0) @map("prs_opened")
+  prsMerged                       Int      @default(0) @map("prs_merged")
+  prsClosed                       Int      @default(0) @map("prs_closed")
+  reviewsGiven                    Int      @default(0) @map("reviews_given")
+  reviewsReceived                 Int      @default(0) @map("reviews_received")
+  issuesClosed                    Int      @default(0) @map("issues_closed")
+  activeRepositories              Int      @default(0) @map("active_repositories")
+  medianTimeToFirstReviewMinutes  Int?     @map("median_time_to_first_review_minutes")
+  medianCycleTimeMinutes          Int?     @map("median_cycle_time_minutes")
+  computedAt                      DateTime @default(now()) @map("computed_at")
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  developer Developer @relation(fields: [developerId], references: [id], onDelete: Cascade)
+
+  @@id([workspaceId, developerId, day])
+  @@index([workspaceId, day])
+  @@map("developer_daily_rollups")
+}
+
+model RepositoryDailyRollup {
+  workspaceId                    String   @map("workspace_id")
+  repositoryId                   String   @map("repository_id")
+  day                            DateTime @db.Date
+  commits                        Int      @default(0)
+  activeContributors             Int      @default(0) @map("active_contributors")
+  prsOpened                      Int      @default(0) @map("prs_opened")
+  prsMerged                      Int      @default(0) @map("prs_merged")
+  prsClosed                      Int      @default(0) @map("prs_closed")
+  openPrsAtEnd                   Int      @default(0) @map("open_prs_at_end")
+  reviewCount                    Int      @default(0) @map("review_count")
+  issuesOpened                   Int      @default(0) @map("issues_opened")
+  issuesClosed                   Int      @default(0) @map("issues_closed")
+  openIssuesAtEnd                Int      @default(0) @map("open_issues_at_end")
+  medianTimeToFirstReviewMinutes Int?     @map("median_time_to_first_review_minutes")
+  medianCycleTimeMinutes         Int?     @map("median_cycle_time_minutes")
+  computedAt                     DateTime @default(now()) @map("computed_at")
+
+  workspace  Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  repository Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+
+  @@id([workspaceId, repositoryId, day])
+  @@index([workspaceId, day])
+  @@map("repository_daily_rollups")
+}
+
+model TeamDailyRollup {
+  workspaceId                    String   @map("workspace_id")
+  teamId                         String   @map("team_id")
+  day                            DateTime @db.Date
+  activeDevelopers               Int      @default(0) @map("active_developers")
+  commits                        Int      @default(0)
+  prsOpened                      Int      @default(0) @map("prs_opened")
+  prsMerged                      Int      @default(0) @map("prs_merged")
+  reviewsGiven                   Int      @default(0) @map("reviews_given")
+  openPrsAtEnd                   Int      @default(0) @map("open_prs_at_end")
+  medianTimeToFirstReviewMinutes Int?     @map("median_time_to_first_review_minutes")
+  medianCycleTimeMinutes         Int?     @map("median_cycle_time_minutes")
+  computedAt                     DateTime @default(now()) @map("computed_at")
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  team      Team      @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  @@id([workspaceId, teamId, day])
+  @@index([workspaceId, day])
+  @@map("team_daily_rollups")
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Intelligence & operations
+// ════════════════════════════════════════════════════════════════════════════
+
+model Insight {
+  id            String        @id @default(cuid())
+  workspaceId   String        @map("workspace_id")
+  ruleId        String        @map("rule_id")
+  severity      Severity
+  subjectType   SubjectType   @map("subject_type")
+  subjectId     String        @map("subject_id")
+  title         String
+  body          String
+  /// The numbers the sentence is built from. Rendering happens outside the
+  /// rule, from a template plus this — which is how one rule serves two locales.
+  evidence      Json          @default("{}")
+  metricKey     MetricKey?    @map("metric_key")
+  changePercent Decimal?      @map("change_percent") @db.Decimal(10, 4)
+  periodStart   DateTime      @map("period_start") @db.Date
+  periodEnd     DateTime      @map("period_end") @db.Date
+  status        InsightStatus @default(ACTIVE)
+  /// ruleId:subjectType:subjectId:periodStart — without this, the 15-minute
+  /// sync re-emits every warning four times an hour.
+  dedupeKey     String        @map("dedupe_key")
+  detectedAt    DateTime      @default(now()) @map("detected_at")
+
+  workspace     Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  notifications Notification[]
+
+  @@unique([workspaceId, dedupeKey])
+  @@index([workspaceId, status, severity])
+  @@index([workspaceId, subjectType, subjectId])
+  @@map("insights")
+}
+
+model Notification {
+  id          String    @id @default(cuid())
+  workspaceId String    @map("workspace_id")
+  userId      String    @map("user_id")
+  type        String
+  insightId   String?   @map("insight_id")
+  title       String
+  body        String
+  readAt      DateTime? @map("read_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  insight   Insight?  @relation(fields: [insightId], references: [id], onDelete: SetNull)
+
+  @@index([userId, readAt, createdAt])
+  @@index([workspaceId])
+  @@map("notifications")
+}
+
+model Report {
+  id                String       @id @default(cuid())
+  workspaceId       String       @map("workspace_id")
+  type              ReportType
+  format            ReportFormat
+  params            Json         @default("{}")
+  status            ReportStatus @default(QUEUED)
+  storageKey        String?      @map("storage_key")
+  requestedByUserId String       @map("requested_by_user_id")
+  error             String?
+  createdAt         DateTime     @default(now()) @map("created_at")
+  completedAt       DateTime?    @map("completed_at")
+
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  requestedBy User      @relation(fields: [requestedByUserId], references: [id])
+
+  @@index([workspaceId, createdAt])
+  @@map("reports")
+}
+
+/// Append-only. No update or delete path exists in the API.
+model AuditLog {
+  id           String   @id @default(cuid())
+  workspaceId  String   @map("workspace_id")
+  actorUserId  String?  @map("actor_user_id")
+  action       String
+  resourceType String   @map("resource_type")
+  resourceId   String?  @map("resource_id")
+  ip           String?
+  userAgent    String?  @map("user_agent")
+  metadata     Json     @default("{}")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  actor     User?     @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, createdAt])
+  @@index([workspaceId, actorUserId])
+  @@map("audit_logs")
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Enums
+// ════════════════════════════════════════════════════════════════════════════
+
+enum Role {
+  OWNER
+  ADMIN
+  MANAGER
+  MEMBER
+  VIEWER
+}
+
+enum Provider {
+  GITHUB
+  GITLAB
+  BITBUCKET
+  SEED
+  /// A bare commit email, belonging to no provider account.
+  GIT
+}
+
+enum IdentityKind {
+  PROVIDER_USER
+  EMAIL
+}
+
+enum IdentityConfidence {
+  EXACT
+  INFERRED
+  MANUAL
+}
+
+enum IntegrationStatus {
+  ACTIVE
+  TOKEN_EXPIRED
+  REVOKED
+  ERROR
+}
+
+enum SyncResource {
+  REPOSITORIES
+  COMMITS
+  PULL_REQUESTS
+  REVIEWS
+  ISSUES
+}
+
+enum SyncStatus {
+  IDLE
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+enum SyncKind {
+  INITIAL
+  INCREMENTAL
+  BACKFILL
+  WEBHOOK
+}
+
+enum RawEventStatus {
+  PENDING
+  PROCESSED
+  FAILED
+  SKIPPED
+}
+
+enum PullRequestState {
+  OPEN
+  MERGED
+  CLOSED
+}
+
+enum ReviewState {
+  APPROVED
+  CHANGES_REQUESTED
+  COMMENTED
+  DISMISSED
+}
+
+enum IssueState {
+  OPEN
+  CLOSED
+}
+
+enum SubjectType {
+  DEVELOPER
+  REPOSITORY
+  TEAM
+  WORKSPACE
+}
+
+enum Granularity {
+  DAY
+  WEEK
+  MONTH
+}
+
+enum ScoreKey {
+  DEVELOPER_HEALTH
+  REPOSITORY_HEALTH
+  TEAM_HEALTH
+}
+
+enum Severity {
+  POSITIVE
+  INFO
+  WARNING
+  CRITICAL
+}
+
+enum InsightStatus {
+  ACTIVE
+  ACKNOWLEDGED
+  RESOLVED
+  EXPIRED
+}
+
+enum ReportType {
+  DEVELOPER
+  REPOSITORY
+  TEAM
+  ORGANIZATION
+  MONTHLY_ENGINEERING
+}
+
+enum ReportFormat {
+  WEB
+  PDF
+  CSV
+  JSON
+}
+
+enum ReportStatus {
+  QUEUED
+  RUNNING
+  READY
+  FAILED
+}
+
+/// The closed metric catalog. Adding a metric is a new member here, never a
+/// migration on a data table. Units and polarity live in src/shared/metrics.ts.
+enum MetricKey {
+  commits
+  lines_changed
+  prs_opened
+  prs_merged
+  prs_open_end
+  pr_merge_rate
+  pr_cycle_time_median
+  pr_time_to_first_review_median
+  pr_size_median
+  pr_review_rounds_median
+  pr_reopen_rate
+  reviews_given
+  reviews_received
+  review_response_time_median
+  review_depth_median
+  review_coverage
+  review_reciprocity
+  reviewer_diversity
+  review_load_gini
+  distinct_collaborators
+  active_days_ratio
+  activity_cv
+  repositories_active
+  contribution_recency
+  active_contributors
+  commit_frequency
+  days_since_last_push
+  stale_pr_ratio
+  open_pr_age_median
+  issues_opened
+  issues_closed
+  issue_close_rate
+  issue_resolution_time_median
+  stale_issue_ratio
+  bus_factor
+  knowledge_concentration
+}

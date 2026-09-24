@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: devintel-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: devintel
+      POSTGRES_PASSWORD: devintel
+      POSTGRES_DB: devintel
+    # Non-default host port so this cannot collide with a local Postgres or
+    # with another project's container.
+    ports:
+      - "5434:5432"
+    volumes:
+      - devintel-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U devintel -d devintel"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: devintel-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6380:6379"
+    volumes:
+      - devintel-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  devintel-pg:
+  devintel-redis:

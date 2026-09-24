@@ -1,0 +1,32 @@
+{
+  // Use the project's TypeScript (6.0.3), not the editor's bundled copy.
+  // A version mismatch shows up as errors in the editor that `pnpm typecheck`
+  // does not reproduce — the single most confusing failure mode in this setup.
+  "typescript.tsdk": "node_modules/typescript/lib",
+  "typescript.enablePromptUseWorkspaceTsdk": true,
+
+  "eslint.useFlatConfig": true,
+  "eslint.validate": ["javascript", "typescript", "typescriptreact"],
+
+  "editor.formatOnSave": true,
+  "editor.defaultFormatter": "esbenp.prettier-vscode",
+  "editor.codeActionsOnSave": {
+    "source.fixAll.eslint": "explicit"
+  },
+
+  // Generated output: readable when needed, never indexed or searched.
+  "files.exclude": {
+    "**/.next": true
+  },
+  "search.exclude": {
+    "src/db/generated": true,
+    "pnpm-lock.yaml": true
+  },
+  "files.watcherExclude": {
+    "**/node_modules/**": true,
+    "**/.next/**": true,
+    "**/src/db/generated/**": true
+  },
+
+  "typescript.preferences.importModuleSpecifierEnding": "js"
+}

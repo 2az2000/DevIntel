@@ -1,0 +1,158 @@
+@import 'tailwindcss';
+
+/**
+ * Design tokens. Every value a component uses comes from here — no component
+ * writes a raw hex. Tokens are named for their ROLE, never their hue, so that
+ * "colors carry meaning" is enforced by naming rather than by discipline.
+ *
+ * Reference: docs/05-frontend.md §3
+ */
+
+:root {
+  /* Surfaces & ink — the complete light palette lives on bare :root so the
+     un-stamped "follow the OS" state always resolves. */
+  --plane: #f7f7f8;
+  --surface-1: #fbfbfc;
+  --surface-2: #ffffff;
+  --surface-inset: #f1f1f3;
+
+  --text-primary: #0b0c0e;
+  --text-secondary: #52545a;
+  --text-muted: #7c7f86;
+
+  --border: rgb(11 12 14 / 0.1);
+  --grid: #e6e6e9;
+  --axis: #c9cace;
+
+  --accent: #2a78d6;
+  --accent-soft: rgb(42 120 214 / 0.1);
+
+  /* Status is reserved: never reused as a chart series color, never carries
+     meaning without an icon and a label beside it. */
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-serious: #ec835a;
+  --status-critical: #d03b3b;
+
+  /* Chart series — fixed slot order, never cycled. Validated against these
+     surfaces; see docs/05-frontend.md §4.1. */
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --series-4: #eda100;
+  --series-5: #e87ba4;
+  --series-6: #008300;
+  --series-7: #4a3aa7;
+  --series-8: #e34948;
+
+  --font-sans: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+}
+
+/* The OS setting, guarded so an explicit light choice still wins. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --plane: #0a0b0d;
+    --surface-1: #101215;
+    --surface-2: #171a1f;
+    --surface-inset: #0d0f12;
+
+    --text-primary: #f5f6f7;
+    --text-secondary: #a8adb6;
+    --text-muted: #6f747d;
+
+    --border: rgb(255 255 255 / 0.08);
+    --grid: #1c1f24;
+    --axis: #2a2e35;
+
+    --accent: #3987e5;
+    --accent-soft: rgb(57 135 229 / 0.14);
+
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --series-4: #c98500;
+    --series-5: #d55181;
+    --series-6: #008300;
+    --series-7: #9085e9;
+    --series-8: #e66767;
+  }
+}
+
+/* The explicit toggle, so it wins in the other direction too. */
+:root[data-theme='dark'] {
+  --plane: #0a0b0d;
+  --surface-1: #101215;
+  --surface-2: #171a1f;
+  --surface-inset: #0d0f12;
+
+  --text-primary: #f5f6f7;
+  --text-secondary: #a8adb6;
+  --text-muted: #6f747d;
+
+  --border: rgb(255 255 255 / 0.08);
+  --grid: #1c1f24;
+  --axis: #2a2e35;
+
+  --accent: #3987e5;
+  --accent-soft: rgb(57 135 229 / 0.14);
+
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
+  --series-4: #c98500;
+  --series-5: #d55181;
+  --series-6: #008300;
+  --series-7: #9085e9;
+  --series-8: #e66767;
+}
+
+@theme inline {
+  --color-plane: var(--plane);
+  --color-surface-1: var(--surface-1);
+  --color-surface-2: var(--surface-2);
+  --color-surface-inset: var(--surface-inset);
+  --color-text-primary: var(--text-primary);
+  --color-text-secondary: var(--text-secondary);
+  --color-text-muted: var(--text-muted);
+  --color-accent: var(--accent);
+  --color-good: var(--status-good);
+  --color-warning: var(--status-warning);
+  --color-serious: var(--status-serious);
+  --color-critical: var(--status-critical);
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
+}
+
+* {
+  border-color: var(--border);
+}
+
+body {
+  /* Explicit, from a token: a transparent body borrows the host's ground. */
+  background: var(--plane);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

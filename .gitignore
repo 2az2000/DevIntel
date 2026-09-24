@@ -1,0 +1,34 @@
+node_modules/
+dist/
+build/
+.next/
+out/
+coverage/
+*.tsbuildinfo
+
+.env
+.env.local
+.env.*.local
+!.env.example
+
+.DS_Store
+Thumbs.db
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+playwright-report/
+test-results/
+blob-report/
+.playwright/
+
+# The generated Prisma client — thousands of lines, rebuilt by `pnpm db:generate`.
+src/db/generated/
+
+# NOT ignored: src/db/tenant-models.generated.ts
+# It is small, it is the list of tables the tenant filter covers, and seeing
+# "+ 'NewModel'," appear in a pull request is real security review signal.
+# CI also checks it with `git diff --exit-code`, which only works on a tracked
+# file — ignoring it would make that check pass vacuously.
+.turbo/
+.vercel/

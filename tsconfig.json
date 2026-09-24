@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": [
+      "ES2023",
+      "DOM",
+      "DOM.Iterable"
+    ],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "forceConsistentCasingInFileNames": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "allowJs": true,
+    "noEmit": true,
+    "incremental": true,
+    "jsx": "react-jsx",
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ],
+    // No `baseUrl` — deprecated in TS 6. Path targets are relative to this file.
+    "paths": {
+      "@/*": [
+        "./src/*"
+      ],
+      "@shared": [
+        "./src/shared/index.ts"
+      ],
+      "@db": [
+        "./src/db/index.ts"
+      ],
+      "@analytics": [
+        "./src/analytics/index.ts"
+      ],
+      "@providers": [
+        "./src/providers/index.ts"
+      ],
+      "@shared/*": [
+        "./src/shared/*"
+      ],
+      "@db/*": [
+        "./src/db/*"
+      ],
+      "@analytics/*": [
+        "./src/analytics/*"
+      ],
+      "@providers/*": [
+        "./src/providers/*"
+      ],
+      "@api/*": [
+        "./src/server/api/*"
+      ],
+      "@worker/*": [
+        "./src/server/worker/*"
+      ],
+      "@components/*": [
+        "./src/components/*"
+      ]
+    }
+  },
+  "include": [
+    "next-env.d.ts",
+    "**/*.ts",
+    "**/*.tsx",
+    ".next/types/**/*.ts",
+    "*.config.ts",
+    "*.config.js",
+    ".next/dev/types/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    ".next",
+    "dist",
+    "coverage"
+  ]
+}

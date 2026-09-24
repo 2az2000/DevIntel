@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # CI runs entirely on seed data, so the full pipeline and every algorithm
+  # assertion execute on each push without a GitHub token and without rate
+  # limits. See docs/06-roadmap.md.
+  DATA_PROVIDER: seed
+  DATABASE_URL: postgresql://devintel:devintel@localhost:5432/devintel
+  REDIS_URL: redis://localhost:6379
+  SESSION_SECRET: ci-secret-that-is-at-least-thirty-two-chars
+  TOKEN_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  NODE_ENV: test
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: devintel
+          POSTGRES_PASSWORD: devintel
+          POSTGRES_DB: devintel
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U devintel"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client and tenant model list
+        run: pnpm db:generate
+
+      - name: Apply migrations
+        run: pnpm db:deploy
+
+      # The generated tenant-model list must match the schema. If a model was
+      # added without regenerating, tenancy coverage would be stale — which is
+      # exactly the failure ADR-0005 exists to prevent.
+      - name: Check generated files are current
+        run: git diff --exit-code -- src/db/tenant-models.generated.ts
+
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm test
+
+      # Integration tests create and migrate their own database on the same
+      # server, and use Redis database 15 so they never collide with anything.
+      - run: pnpm test:int
+      - run: pnpm build
